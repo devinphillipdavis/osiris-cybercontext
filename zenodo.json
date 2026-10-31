@@ -1,0 +1,53 @@
+{
+  "title": "OSIRIS × CyberContext v0.3.0: Real SciFact Backend, Multi-Corpus BEIR Evaluation, and EXP-OLMO3 Evidence Capsule",
+  "upload_type": "publication",
+  "publication_type": "technicalnote",
+  "version": "0.3.0",
+  "publication_date": "2026-10-31",
+  "description": "<p><strong>v0.3.0</strong> integrates the Real SciFact Backend, the sealed <code>EXP-OLMO3-BEIR-SCIFACT-001</code> benchmark evidence capsule, and multi-corpus evaluation across SciFact, NFCorpus, and CQADupStack.</p><p><b>OSIRIS × CyberContext</b> is a zero-dependency, local-first companion runtime for autonomous coding agents, dense retrieval benchmarking, and low-latency physical device abstraction.</p><p><b>Key Architecture &amp; Guarantees:</b></p><ul><li><b>Real SciFact Backend &amp; BEIR Evaluation:</b> Replaces mock stubs with live, end-to-end evaluation against real SciFact abstract retrieval and claims verification datasets, recording MRR@10, NDCG@10, and CTC into append-only SQLite ledgers.</li><li><b>EXP-OLMO3 Evidence Capsule:</b> Cryptographically verified benchmark evidence capsule (<code>benchmark_capsule.evidence.zip</code>) ensuring reproducibility and zero credential leakage.</li><li><b>CyberContext AST Provenance Firewall:</b> L0/L1 deterministic static AST parser inspecting incoming session turns prior to SQLite memory compaction, neutralizing prompt injection and blocking dynamic execution primitives (exec, eval, os.system).</li><li><b>Tandemonium Hardware Mesh:</b> Dual-substrate capability contracts (mobile edge vs compute workstation) enforcing strict execution horizons (300s / 1800s) and range-validated telemetry dispatching.</li></ul><p>Source Code Repository: <a href=\"https://github.com/osiris-dnalang/osiris-cybercontext\">https://github.com/osiris-dnalang/osiris-cybercontext</a></p>",
+  "creators": [
+    {
+      "name": "Davis, Devin Phillip",
+      "affiliation": "Agile Defense Systems LLC"
+    },
+    {
+      "name": "OSIRIS Autonomous Research Runtime",
+      "affiliation": "DNA::}{::Lang Ecosystem"
+    }
+  ],
+  "access_right": "open",
+  "license": "cc-by-4.0",
+  "keywords": [
+    "autonomous agents",
+    "AST firewall",
+    "prompt injection defense",
+    "cybercontext",
+    "olmo-3",
+    "MTEB",
+    "BEIR",
+    "scifact",
+    "benchmark integrity",
+    "tamper-evident ledger",
+    "dual-substrate runtime",
+    "Tandemonium",
+    "reproducible AI",
+    "cryptographic verification"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/osiris-dnalang/osiris-cybercontext/releases/tag/v0.3.0",
+      "relation": "isSupplementTo",
+      "scheme": "url"
+    },
+    {
+      "identifier": "10.5281/zenodo.23305204",
+      "relation": "isNewVersionOf",
+      "scheme": "doi"
+    },
+    {
+      "identifier": "10.5281/zenodo.23832237",
+      "relation": "references",
+      "scheme": "doi"
+    }
+  ]
+}
