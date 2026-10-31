@@ -143,13 +143,16 @@ class ReplayEngine:
         tolerance: float = 1e-4,
         real_data_dir: Optional[str] = None,
         component_factory: Optional[Callable[[Any], Any]] = None,
+        allowed_signers: Optional[str] = None,
     ) -> ReplayVerdict:
         """Checks file checksums, re-runs the stored spec in a fresh engine, and diffs the results.
 
         ``real_data_dir`` is the dataset directory used to re-run capsules from
         the real backends; without it such capsules are NOT_REPLAYABLE.
         ``component_factory(spec)`` overrides the (retriever, reranker) of a
-        dense re-run (tests inject stand-ins).
+        dense re-run (tests inject stand-ins). ``allowed_signers`` is the
+        allowed-signers file that a stored remote-dispatch grant is checked
+        against; without it, such a capsule is NOT_REPLAYABLE.
         """
 
         def verdict(status, details, experiment_id="UNKNOWN", stored=None, **kw):
@@ -220,7 +223,8 @@ class ReplayEngine:
             real_ledger = EvidenceLedger(":memory:")
             try:
                 components = component_factory(spec) if component_factory else None
-                replay_result = run_real_scifact(spec, real_data_dir, ledger=real_ledger, components=components)
+                replay_result = run_real_scifact(spec, real_data_dir, ledger=real_ledger, components=components,
+                                                 allowed_signers=allowed_signers)
                 consistency_problems = record_consistency_problems(
                     stored_records, stored_metrics, load_beir_dataset(real_data_dir, split=spec.split))
             except (GovernanceAuthorizationViolation, QuotaExceededViolation) as e:
@@ -235,7 +239,7 @@ class ReplayEngine:
             finally:
                 real_ledger.close()
         else:
-            engine = EvidenceWorkbenchEngine()
+            engine = EvidenceWorkbenchEngine(allowed_signers=allowed_signers)
             try:
                 replay_result = engine.execute(spec)
             except (GovernanceAuthorizationViolation, QuotaExceededViolation) as e:

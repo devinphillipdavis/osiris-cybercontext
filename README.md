@@ -106,23 +106,31 @@ osiris-cybercontext/
 │   ├── benchmark_harness.py  # NDCG/MRR scoring of supplied rankings, logged to the ledger
 │   ├── ast_firewall.py       # Session-turn screen (regex deny-list + AST check)
 │   ├── hardware_mesh.py      # Host/CPU profile and mock device-event contract
-│   └── ledger.py             # Append-only SHA-256 hash chain in SQLite
+│   ├── ledger.py             # Append-only SHA-256 hash chain in SQLite, with head checkpoints
+│   └── signing.py            # SSH Ed25519 (SSHSIG) verification in pure Python; signing via ssh-keygen
 ├── workbench/
 │   ├── __init__.py           # Workbench exports
 │   ├── schema.py             # Experiment specs, policies and canonical JSON digests
 │   ├── engine.py             # Policy-gated engine with simulated retrieval
+│   ├── analysis.py           # BM25 analyzers: the simple split, and Lucene-style English analysis
 │   ├── real_scifact.py       # Optional real backends over a local BEIR copy: BM25, dense, reranked
 │   ├── real_models.py        # Dense embedding retriever and experimental LLM reranker (optional extras)
 │   ├── beir_download.py      # Downloads a BEIR dataset from the Hugging Face Hub (stdlib)
-│   ├── capsule.py            # Evidence capsule packager (.evidence.zip)
+│   ├── capsule.py            # Evidence capsule packager (.evidence.zip), with manifest signing
+│   ├── checkpoint.py         # Signed ledger checkpoints (kept outside the ledger database)
 │   ├── replay.py             # Re-runs a capsule's spec and compares the results
-│   └── cli.py                # CLI: run, run-real, download-beir, verify, replay, attack-demo
+│   └── cli.py                # CLI: run, run-real, download-beir, grant, sign, verify, replay, ledger-checkpoint, ledger-check, attack-demo
 ├── requirements-real.txt     # Optional extras for the dense backend and the reranker
 └── tests/
     ├── test_bridge.py        # Core module tests
     ├── test_workbench.py     # Evidence Workbench tests
     ├── test_cli.py           # End-to-end demo and CLI tests
     ├── test_real_scifact.py  # BM25 backend tests over a synthetic toy dataset
+    ├── test_analysis.py      # Analyzers, Porter stemmer, length encoding; opt-in Pyserini parity check
+    ├── test_signing.py       # SSH signature verifier: RFC 8032 vectors, ssh-keygen interop, allowed-signers rules
+    ├── test_signed_capsules.py  # Capsule signing, forgery and stripping, CLI exit codes
+    ├── test_checkpoint.py    # Ledger checkpoints: truncation and rewrite detection; signed checkpoints
+    ├── test_grants.py        # Signed grants: budget, trust root, issue-dispatch-replay through the CLI
     ├── test_real_dense.py    # Dense, reranker and download tests (stand-in models, local HTTP server)
     └── test_real_models.py   # Dense/Olmo code paths on tiny random models (needs the extras)
 ```
@@ -156,9 +164,37 @@ python -m workbench.cli attack-demo benchmark_capsule.evidence.zip
 
 | Check | Catches | Doesn't catch |
 |---|---|---|
-| `verify` | Corruption; a listed file edited without updating its checksum; missing, unlisted or duplicate files | Any edit to `manifest.json` itself (metrics, spec, labels: nothing checks it), and a file edited **and** its checksum rewritten (the manifest is unsigned) |
+| `verify` | Corruption; a listed file edited without updating its checksum; missing, unlisted or duplicate files. With `--allowed-signers`, also any change to `manifest.json` and any file edited with its checksum rewritten, because the signature covers the manifest | Without `--allowed-signers`, or on an unsigned capsule: a file edited **and** its checksum rewritten, and any edit to `manifest.json` (nothing checks an unsigned manifest) |
 | `replay` | Per-query records, chain digest, manifest metrics and counts, the experiment ID, the backend label and notice, and the figures and labels in `summary.md` that differ from re-running the spec. Simulated capsules must match exactly. | Someone who changes the spec itself and repackages. Spec fields outside the canonical digest (`created_at_iso`, `timeout_seconds`, the stored grant) are not compared. A capsule that claims a backend other than the simulated engine or the BM25 backend can't be re-run here and is reported `NOT_REPLAYABLE`; a BM25 capsule re-runs only when the same SciFact directory is supplied (`replay --data`). For a real model run, replay would mean re-running the model. |
-| Ledger chain check (`verify_integrity`) | Edits to a stored block that leave its hash alone; deleted or reordered blocks before the newest one | Deleting the newest blocks (or all of them); timestamp edits under 1e-4 s; rewriting a block and recomputing every later hash |
+| Ledger chain check (`verify_integrity`) | Edits to a stored block that leave its hash alone; deleted or reordered blocks before the newest one | Deleting the newest blocks (or all of them); timestamp edits under 1e-4 s; rewriting a block and recomputing every later hash. A signed checkpoint (below) catches those two. |
+
+### Signed capsules, ledger checkpoints and grants (v0.4.0)
+
+Signatures use OpenSSH's SSHSIG format with Ed25519 keys, so an ordinary `ssh-keygen -t ed25519` key works. The checking code (`core/signing.py`) needs no Python packages: RFC 8032 verification in pure Python, checked against the RFC's test vectors and against `ssh-keygen` output. Signing runs `ssh-keygen -Y sign`, so the private key stays out of this process. The trust root is an allowed-signers file in OpenSSH's format. Each line names a principal and the namespaces its key may sign for, and `namespaces=` is required:
+
+```
+custodian namespaces="dnalang-evidence-capsule,dnalang-ledger-checkpoint,dnalang-authorization-grant" ssh-ed25519 AAAA... comment
+```
+
+```bash
+# Sign a capsule's manifest (adds manifest.json.sig; the manifest lists every file's checksum):
+python -m workbench.cli sign benchmark_capsule.evidence.zip --key ~/.ssh/osiris_custodian
+# Check the signature and the files (exit 0 only when the signature is VALID):
+python -m workbench.cli verify benchmark_capsule.evidence.zip --allowed-signers allowed_signers --identity custodian --require-signature
+
+# Anchor a ledger database's head outside it, then check that the database still extends that head:
+python -m workbench.cli ledger-checkpoint ledger.db --key ~/.ssh/osiris_custodian --out checkpoint.json
+python -m workbench.cli ledger-check ledger.db checkpoint.json --allowed-signers allowed_signers --identity custodian
+
+# Remote dispatch: an operator signs a grant for one spec digest; the run and the replay check it:
+python -m workbench.cli run --mode REMOTE_DISPATCH --queries 5                 # prints the Canonical Spec Digest
+python -m workbench.cli grant --key ~/.ssh/operator --operator devin --grant-id G-1 \
+    --payload-sha256 <digest> --budget 10 --expires 2099-01-01T00:00:00Z --out grant.json
+python -m workbench.cli run --mode REMOTE_DISPATCH --queries 5 --grant grant.json --allowed-signers allowed_signers --out remote.evidence.zip
+python -m workbench.cli replay remote.evidence.zip --allowed-signers allowed_signers
+```
+
+A VALID result means the key is listed for that identity and namespace. It does not show who controls the key. The key, the allowed-signers file and the checkpoint file are the trust root, so keep them away from whoever writes the capsule or the database. An unsigned capsule still passes the checksum check; `--require-signature` makes that a failure. `ledger-check` opens the database read-only.
 
 ### Real SciFact retrieval (optional extra)
 
@@ -168,8 +204,11 @@ python -m workbench.cli attack-demo benchmark_capsule.evidence.zip
 # 1. Download SciFact (needs network access to huggingface.co; --revision <commit SHA> pins the data):
 python -m workbench.cli download-beir scifact --dest data/scifact
 
-# 2a. BM25, standard library only:
+# 2a. BM25, standard library only (the default analyzer):
 python -m workbench.cli run-real --data data/scifact --out scifact_bm25.evidence.zip
+
+# 2a'. BM25 with Lucene-style English analysis (matches Pyserini's flat index; see below):
+python -m workbench.cli run-real --data data/scifact --analyzer lucene-english --out scifact_lucene.evidence.zip
 
 # 2b. Dense retrieval with an embedding model (pip install -r requirements-real.txt):
 python -m workbench.cli run-real --data data/scifact --backend dense \
@@ -187,7 +226,7 @@ python -m workbench.cli replay scifact_bm25.evidence.zip --data data/scifact
 
 **Replaying real runs.** BM25 replays exactly (`EXACT_MATCH`) against the same dataset files. Dense and reranked runs can differ slightly across hardware and library versions, so replay accepts metrics within `--tolerance` (`STATISTICAL_EQUIVALENCE`). It also checks that every stored record's NDCG, MRR, grades and digest follow from its own ranking and the qrels, and that the manifest's means follow from the records. One consequence: a capsule whose rankings were rewritten consistently, without moving the metrics, also passes as equivalence. The capsule records the dataset files' SHA-256s, library versions, the model's resolved revision and the device; replay against different files reports `NOT_REPLAYABLE`. Pass `--model-revision <commit SHA>` to pin the model.
 
-The BM25 parameters match the BEIR paper's Pyserini baseline (k1=0.9, b=0.4), but the tokenizer here is a simple lowercase `[a-z0-9]+` split with no stemming, stopping or field weighting, so expect different scores. The paper's BM25 SciFact number (NDCG@10 0.665) is a sanity neighborhood, not a value this code reproduces: no number from this backend has been validated against a published reference. Set `OSIRIS_SCIFACT_DIR` to run the opt-in real-corpus test.
+**Analyzers and the reference numbers.** `--analyzer` picks the text analysis, and the choice is recorded in the spec as `retrieval_options.analyzer`. The default, `simple`, lowercases and splits on `[a-z0-9]+`; it scores a mean NDCG@10 of 0.6588 on the test split. `lucene-english` reproduces Lucene's English analysis (`workbench/analysis.py`): UAX #29-style tokenization, possessive removal, Lucene's English stop list, the Porter stemmer with its later revisions, Lucene's one-byte document lengths, and a score for each occurrence of a repeated query term. On the 300 judged SciFact test queries it matches Pyserini's prebuilt `beir-v1.0.0-scifact.flat` index (k1=0.9, b=0.4): every document's term vector and every query's top-10 ranking are identical, and the mean NDCG@10 is 0.6789 (MRR@10 0.6457). The 0.665 often quoted for BM25 on SciFact is the BEIR paper's figure, which is neither of these: Pyserini's multifield index gives 0.6639 with the same k1 and b. The comparison used Pyserini 2.4.0 on this corpus (`download-beir`). `OSIRIS_SCIFACT_DIR=data/scifact python -m pytest tests/test_analysis.py` repeats the lucene-english check, and `OSIRIS_SCIFACT_DIR` also enables the other opt-in real-corpus tests.
 
 ---
 
@@ -195,12 +234,12 @@ The BM25 parameters match the BEIR paper's Pyserini baseline (k1=0.9, b=0.4), bu
 
 | Component | Status |
 |---|---|
-| Hash-chained SQLite ledger (`core/ledger.py`) | **Real.** SHA-256 chain that detects in-place edits. No signatures, no external anchoring. |
-| Capsule checksums (`workbench/capsule.py`) | **Real.** SHA-256 per file, checked against an unsigned manifest. |
+| Hash-chained SQLite ledger (`core/ledger.py`) | **Real.** SHA-256 chain that detects in-place edits. `checkpoint()` and `check_checkpoint()` detect truncation and rewritten history against a signed checkpoint kept elsewhere (`ledger-checkpoint`, `ledger-check`). Without a checkpoint kept outside the database, nothing detects a rewrite. |
+| Capsule checksums and signature (`workbench/capsule.py`, `core/signing.py`) | **Real.** SHA-256 per file, checked against the manifest. `sign` adds an SSH Ed25519 signature over the manifest, and `verify --allowed-signers` checks it. A valid signature shows that a listed key signed the manifest, not who controls that key. |
 | Replay comparison (`workbench/replay.py`) | **Real comparison.** What it re-runs is the simulated engine or a real backend. For the simulated engine and BM25 a match shows determinism; dense and reranked runs are compared within a tolerance. |
-| Policy gates (query ceiling, authorization grant) | **Real checks.** The grant "signature" is an unkeyed SHA-256 anyone can compute; expiry, budget and `timeout_seconds` are recorded but not enforced. |
+| Policy gates (query ceiling, authorization grant) | **Real checks.** A remote-dispatch grant must be signed by a key the allowed-signers file lists for its operator, name the spec's digest, and cover its query count. The budget is enforced; `expires_at_iso` and `timeout_seconds` are recorded but not enforced. |
 | Workbench retrieval (`workbench/engine.py`) | **Simulated.** Seeded RNG, a relevant document planted at a random rank (or left out about 1 query in 6), ten placeholder claims (cycled beyond ten queries, so query IDs repeat); not read from the BEIR SciFact dataset. A ranking can contain the same document ID twice. Each record's `relevance_scores` are 0/1 relevance labels, not retriever scores. |
-| Real BM25 backend (`workbench/real_scifact.py`) | **Real retrieval over a real corpus** you supply locally: Okapi BM25 (k1=0.9, b=0.4), graded NDCG@10 / MRR@10 against the dataset's qrels. A lexical baseline, not a neural model; its numbers have **not** been validated against a published reference. |
+| Real BM25 backend (`workbench/real_scifact.py`, `workbench/analysis.py`) | **Real retrieval over a real corpus** you supply locally: Okapi BM25 (k1=0.9, b=0.4), graded NDCG@10 / MRR@10 against the dataset's qrels. A lexical baseline, not a neural model. With `--analyzer lucene-english` its rankings match Pyserini's prebuilt BEIR SciFact flat index on all 300 test queries; the default `simple` analyzer has not been validated. |
 | Dense backend and reranker (`workbench/real_models.py`) | **Real models** when the extras are installed: a sentence-transformers embedding model, and optionally a generative model (e.g. Olmo 3) prompted to rate candidates 0-10. Tested on tiny random-weight models only; no SciFact number from them has been validated against a published reference. |
 | Demo retrieval (`demo.py`) | **Hand-written** rankings for three queries. |
 | "Olmo 3" | In `run` and the demo, **a label**; not loaded. With `run-real --backend dense --rerank-model allenai/Olmo-3-7B-Instruct`, **loaded** and used as the experimental reranker. (`allenai/Olmo-3-7B-Instruct` is a generative model; retrieval itself needs BM25 or an embedding model.) The simulated spec's `similarity_metric` is a label. |
@@ -214,18 +253,26 @@ The BM25 parameters match the BEIR paper's Pyserini baseline (k1=0.9, b=0.4), bu
 
 ## Known limits
 
-- **No proof of origin.** Nothing is signed, so a capsule or ledger can't show who produced it. Anyone with write access can rebuild a consistent chain or capsule.
-- **The ledger can be truncated.** Deleting the newest blocks is not detected, because no head hash or block count is kept anywhere else.
-- **Old-format capsules skip the label check.** A v1.0.0 manifest has no retrieval-backend label, and since the manifest is unsigned, anyone can mark a capsule as v1.0.0.
+- **Proof of origin depends on the key, which is the trust root.** An unsigned capsule or ledger can't show who produced it, and anyone with write access can rebuild its checksums or chain. A signed capsule shows only that a listed key signed it. If that key or the allowed-signers file sits with the party being checked, the signature proves little.
+- **The ledger can be truncated undetected unless a checkpoint was taken and kept elsewhere.** `verify_integrity` cannot see deleted newest blocks. `ledger-check` can, against a signed checkpoint held outside the database.
+- **Old-format capsules skip the label check.** A v1.0.0 manifest has no retrieval-backend label. An unsigned manifest can be edited freely, so anyone can mark a capsule as v1.0.0 unless it is signed.
 - **Replay is version-sensitive.** Capsules don't pin a code version. If the engine code changes, replaying an older capsule reports drift.
 - **Replay of the simulated engine is a determinism check**, not an independent reproduction of a model evaluation. Replay of the BM25 backend is deterministic for the same corpus and code, and needs the same corpus directory.
 - **Dense and reranked runs are only as reproducible as their inputs.** They depend on the model revision, library versions and hardware. Replay compares them within a tolerance, so a consistently rewritten ranking that keeps the metrics passes.
-- **The BM25 backend's SciFact numbers are unvalidated.** Its tokenizer differs from Pyserini's, so its scores are not comparable with the BEIR paper's BM25 baseline; treat published numbers only as a sanity neighborhood until you validate your own run.
+- **The default BM25 analyzer is not validated.** `simple` (the default) scores 0.6588 on the SciFact test split, about 0.02 below Pyserini's flat index. `lucene-english` matches that index. Making it the default would change the scores and digests of new runs, so that is left as a release decision.
 - **The turn screen can be bypassed**, as described above.
+- **No sandbox, because nothing here executes generated code.** The turn screen (`core/ast_firewall.py`) is a regex and AST heuristic that flags suspicious text; it is not a boundary. The only subprocess call in `core/` and `workbench/` is the `ssh-keygen` call in `core/signing.py`. A later version that runs model-written code needs OS-level isolation, such as bubblewrap, rather than the screen.
 
 ## Changes since v0.1.0
 
 v0.1.0 (`c4ac9c1`) contained the core modules and the demo. The evidence workbench was added afterwards (`e92e960`), so the workbench items below describe changes since that commit.
+
+**v0.4.0: signed evidence, grants and BM25 parity**
+- New `core/signing.py`: SSH Ed25519 signatures in OpenSSH's SSHSIG format. Verification is pure Python (RFC 8032, checked against the RFC's test vectors and against `ssh-keygen` output). Signing runs `ssh-keygen -Y sign`. Allowed-signers files must name namespaces, and wildcards and unsupported options are errors rather than being skipped.
+- Capsules: `sign` adds `manifest.json.sig`. `verify --allowed-signers --identity` checks it after the checksums, and `--require-signature` fails unsigned capsules. `unpack` accepts that one extra file. The signature covers the manifest, which lists every file's checksum, the chain digest and the block count.
+- Ledgers: `checkpoint()` and `check_checkpoint()` in `core/ledger.py`, signed by `workbench/checkpoint.py` (`ledger-checkpoint`, `ledger-check`). `EvidenceLedger(path, read_only=True)` lets a checker avoid changing the evidence it reads. The check catches deleted newest blocks and history rewritten with recomputed hashes, which `verify_integrity` cannot see.
+- **Breaking:** authorization grants are signed. `AuthorizationGrant.signature` is now an SSH signature over the grant's fields, checked against the allowed signers for `operator`. Unkeyed grants from earlier versions are refused, so remote dispatch and replay of such capsules now need `--allowed-signers`. The query budget is enforced. Expiry is still only recorded. The CLI gains `grant`, `run --grant --allowed-signers` and `replay --allowed-signers`.
+- `workbench/analysis.py` and `run-real --analyzer lucene-english`: Lucene-style English analysis and BM25 scoring. Validated against Pyserini's flat SciFact index (see "Real SciFact retrieval"). The default `simple` analyzer and its existing digests are unchanged. A real-run capsule's notice names the analyzer when `lucene-english` is used.
 
 **Core modules and demo**
 - Fixes NDCG@10 in the harness: the ideal ranking now counts relevant documents the retriever missed (it used to report 1.0 for a correct top-1 even when another relevant document was never retrieved), and a repeated relevant document counts once. Results are now ranked by score instead of list order, queries with no relevant documents are left out of the means (`BatchMetrics.scored_queries`), and the default model label is the real `allenai/Olmo-3-7B-Instruct` ID. The demo's numbers are unchanged.
@@ -251,7 +298,7 @@ v0.1.0 (`c4ac9c1`) contained the core modules and the demo. The evidence workben
 ## Next Steps When You Have Time
 
 When you wrap up your Olmo 3 MTEB runs, let's connect:
-- **Plugging in your Olmo 3 / MTEB runs:** `run-real` covers BM25, embedding retrieval and Olmo 3 reranking on BEIR SciFact. Your own evaluation output (scored results and binary qrels) can also go straight into `core/benchmark_harness.py`. Either way, check the numbers against MTEB's before relying on them. Signing capsules would be the step that makes them trustworthy to a third party.
+- **Plugging in your Olmo 3 / MTEB runs:** `run-real` covers BM25, embedding retrieval and Olmo 3 reranking on BEIR SciFact. Your own evaluation output (scored results and binary qrels) can also go straight into `core/benchmark_harness.py`. Either way, check the numbers against MTEB's before relying on them. Signing capsules, checkpoints and grants is in v0.4.0; a third party can trust them only if the signing key is held outside the party being checked. Anchoring checkpoints externally (a timestamp authority, or a tag pushed to a repository the database's writer cannot rewrite) is the next step.
 - **CyberContext hook:** `core/ast_firewall.py` could run as a pre-store tripwire in your SQLite session pipeline, alongside real isolation rather than instead of it.
 
 ---

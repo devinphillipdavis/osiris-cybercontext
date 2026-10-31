@@ -7,15 +7,17 @@ recompute its hash and every later hash (for example a direct SQL UPDATE of a
 metric), and deleted or re-ordered blocks before the newest one.
 
 What it does not detect:
-- Deleting the newest block(s), or all of them: no head hash or block count is
-  stored anywhere else to compare with.
+- Deleting the newest block(s), or all of them. Only check_checkpoint() shows
+  this, and only against a checkpoint taken earlier and kept outside the database.
 - Timestamp edits smaller than 1e-4 s, because the hash covers the timestamp
   rounded to 4 decimals, and edits that move text across the ':' separators
   between hashed fields.
 - A rewrite of any block followed by recomputing the rest of the chain, which
-  anyone with write access to the database can do.
-There is no signature and no external anchor, so a passing check means "this
-file is internally consistent", not "this history is authentic".
+  anyone with write access to the database can do. check_checkpoint() catches
+  it for any head that was checkpointed before the rewrite.
+A passing verify_integrity() means "this file is internally consistent", not
+"this history is authentic". Authenticity needs a signed checkpoint whose key and
+storage are kept away from the database's writer (workbench/checkpoint.py).
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ import json
 import sqlite3
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -61,10 +64,16 @@ class EvidenceLedger:
 
     GENESIS_HASH = "0" * 64
 
-    def __init__(self, db_path: str = ":memory:"):
+    def __init__(self, db_path: str = ":memory:", read_only: bool = False):
         self.db_path = db_path
-        self.conn = sqlite3.connect(self.db_path)
-        self._init_db()
+        if read_only:
+            # A checker must not create or change the evidence it reads.
+            if db_path == ":memory:":
+                raise ValueError("a read-only ledger needs a database file")
+            self.conn = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
+        else:
+            self.conn = sqlite3.connect(self.db_path)
+            self._init_db()
 
     def _init_db(self):
         cursor = self.conn.cursor()
@@ -169,6 +178,41 @@ class EvidenceLedger:
             return self.GENESIS_HASH
         combined = ":".join(hashes)
         return compute_sha256(combined)
+
+    def checkpoint(self) -> Dict[str, Any]:
+        """The chain head: block count, head hash and chain digest, for keeping outside the database."""
+        block_count, head_hash = self.get_latest_hash()
+        return {"block_count": block_count, "head_hash": head_hash, "chain_digest": self.chain_digest()}
+
+    def check_checkpoint(self, checkpoint: Dict[str, Any]) -> Tuple[bool, str]:
+        """Check that this ledger still extends a checkpoint taken earlier.
+
+        Fails when the chain is internally broken (verify_integrity), when the
+        ledger has fewer blocks than the checkpoint (newest blocks were deleted),
+        when the block at the checkpoint's height has another hash (history was
+        rewritten after the checkpoint), or when the digest over the checkpointed
+        blocks differs. Blocks added after the checkpoint are allowed.
+        """
+        count = checkpoint.get("block_count")
+        head_hash = checkpoint.get("head_hash")
+        digest = checkpoint.get("chain_digest")
+        if (not isinstance(count, int) or isinstance(count, bool) or count < 0
+                or not isinstance(head_hash, str) or not isinstance(digest, str)):
+            raise ValueError("malformed checkpoint: needs block_count, head_hash and chain_digest")
+
+        ok, message = self.verify_integrity()
+        if not ok:
+            return False, message
+        hashes = [row[0] for row in self.conn.execute("SELECT current_hash FROM ledger ORDER BY entry_id ASC")]
+        if len(hashes) < count:
+            return False, (f"ledger has {len(hashes)} blocks, fewer than the checkpoint's {count}: "
+                           "the newest blocks were deleted")
+        anchored = hashes[:count]
+        if (anchored[-1] if anchored else self.GENESIS_HASH) != head_hash:
+            return False, f"block #{count} does not match the checkpoint: history was rewritten after it was taken"
+        if (compute_sha256(":".join(anchored)) if anchored else self.GENESIS_HASH) != digest:
+            return False, "the chain digest over the checkpointed blocks does not match the checkpoint"
+        return True, f"ledger extends the checkpoint: {len(hashes)} blocks, block #{count} matches"
 
     def get_merkle_root(self) -> str:
         """Deprecated alias for chain_digest(); the value is not a Merkle root."""

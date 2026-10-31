@@ -52,6 +52,41 @@ class QuotaExceededViolation(Exception):
     pass
 
 
+def enforce_remote_dispatch_grant(spec: ExperimentSpec, allowed_signers: str | None) -> None:
+    """Invariant Gate 2 (SYS-021): remote dispatch needs a grant signed by an allowed signer.
+
+    The grant must name this spec's digest, be signed by a key the allowed-signers
+    file lists for the grant's operator, and cover the spec's query count. With
+    no allowed-signers file the grant cannot be verified, so the gate refuses.
+    """
+    policy = spec.execution_policy
+    if not (policy.mode == "REMOTE_DISPATCH" or policy.require_authorization_grant):
+        return
+    spec_digest = spec.canonical_digest()
+    if policy.grant is None:
+        raise GovernanceAuthorizationViolation(
+            f"Remote dispatch rejected: missing authorization grant for payload {spec_digest}."
+        )
+    if allowed_signers is None:
+        raise GovernanceAuthorizationViolation(
+            "Remote dispatch rejected: no allowed-signers file is configured, so the grant cannot be verified."
+        )
+    try:
+        valid = policy.grant.verify(spec_digest, allowed_signers)
+    except (OSError, ValueError) as e:
+        raise GovernanceAuthorizationViolation(f"Remote dispatch rejected: the grant cannot be checked: {e}") from e
+    if not valid:
+        raise GovernanceAuthorizationViolation(
+            f"Remote dispatch rejected: grant does not match payload {spec_digest} or is not signed by an "
+            f"allowed signer for operator {policy.grant.operator!r}."
+        )
+    if spec.query_count > policy.grant.max_query_budget:
+        raise GovernanceAuthorizationViolation(
+            f"Remote dispatch rejected: {spec.query_count} queries exceed the grant's budget of "
+            f"{policy.grant.max_query_budget}."
+        )
+
+
 @dataclass
 class QueryRecord:
     query_id: str
@@ -84,8 +119,9 @@ class ExecutionResult:
 class EvidenceWorkbenchEngine:
     """Runs a (simulated) benchmark spec behind the policy gates and records it in a ledger."""
 
-    def __init__(self, ledger: EvidenceLedger | None = None):
+    def __init__(self, ledger: EvidenceLedger | None = None, allowed_signers: str | None = None):
         self.ledger = ledger or EvidenceLedger(":memory:")
+        self.allowed_signers = allowed_signers
 
     def execute(self, spec: ExperimentSpec) -> ExecutionResult:
         """Execute the benchmark specification under governed invariants."""
@@ -100,15 +136,7 @@ class EvidenceWorkbenchEngine:
 
         # Invariant Gate 2: Enforce Authorization for Remote Dispatch
         spec_digest = spec.canonical_digest()
-        if policy.mode == "REMOTE_DISPATCH" or policy.require_authorization_grant:
-            if policy.grant is None:
-                raise GovernanceAuthorizationViolation(
-                    f"Remote dispatch rejected: missing authorization grant for payload {spec_digest[:16]}."
-                )
-            if not policy.grant.verify(spec_digest):
-                raise GovernanceAuthorizationViolation(
-                    f"Remote dispatch rejected: grant does not match payload {spec_digest[:16]}."
-                )
+        enforce_remote_dispatch_grant(spec, self.allowed_signers)
 
         # Environment Telemetry Capture
         env_telemetry = {
