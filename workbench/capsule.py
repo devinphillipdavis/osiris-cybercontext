@@ -2,7 +2,9 @@
 
 Bundles the experiment spec, the per-query records and a summary into a
 .evidence.zip capsule, with a manifest listing each file's SHA-256. The manifest
-itself is not signed (see EvidenceCapsule.unpack).
+can be signed with an SSH Ed25519 key (EvidenceCapsule.sign, workbench/signing
+rules in core/signing.py). The signature covers manifest.json, and the manifest
+lists every other file's checksum, so one passing check covers the whole capsule.
 """
 
 from __future__ import annotations
@@ -15,14 +17,18 @@ import zipfile
 from dataclasses import asdict
 from typing import Any, Dict
 
+from core import signing
 from core.ledger import compute_sha256
 from .engine import ExecutionResult, RETRIEVAL_BACKEND, SIMULATION_NOTICE
-from .real_scifact import NOTICES
+from .real_scifact import notice_for
 from .schema import canonical_json_bytes, ExperimentSpec
 
 
 REQUIRED_MANIFEST_KEYS = ("experiment_id", "spec_digest", "chain_digest", "metrics", "spec", "manifest_files")
 CHECKSUMMED_FILES = ("raw_queries.json", "summary.md")
+# The signature cannot be listed in the manifest it signs, so it is the one extra file a capsule may carry.
+SIGNATURE_NAME = "manifest.json.sig"
+CAPSULE_NAMESPACE = "dnalang-evidence-capsule"
 
 # summary.md bullet labels -> field names (v1.0.0 labels included)
 _SUMMARY_LABELS = {
@@ -75,11 +81,7 @@ class EvidenceCapsule:
         # 2. Prepare summary.md
         simulated = result.retrieval_backend == RETRIEVAL_BACKEND
         rerank_model = (result.spec.retrieval_options or {}).get("rerank_model")
-        notice = (
-            SIMULATION_NOTICE
-            if simulated
-            else NOTICES.get(result.retrieval_backend, "")
-        )
+        notice = SIMULATION_NOTICE if simulated else notice_for(result.spec)
         summary_md = (
             f"# DNA-Lang Evidence Capsule: {result.spec.experiment_id}\n\n"
             + (f"> {notice}\n\n" if notice else "")
@@ -135,12 +137,11 @@ class EvidenceCapsule:
 
         This catches corruption, edits to a listed file that don't also update
         the manifest, files missing from or added to the capsule, and duplicate
-        file names. It does
-        not check manifest.json itself: its metrics, spec and labels can be
-        edited freely, and someone who edits a file and rewrites its checksum
-        produces a capsule that passes. ReplayEngine.replay re-runs the spec and
-        compares the results; proving who produced a capsule would need a
-        signature.
+        file names. It does not check manifest.json itself, and an unsigned
+        capsule's manifest can be edited freely: someone who edits a file and
+        rewrites its checksum produces a capsule that passes. verify_signature
+        checks the manifest against a trusted key; ReplayEngine.replay re-runs
+        the spec and compares the results.
         """
         if not os.path.exists(capsule_path):
             raise FileNotFoundError(f"Evidence capsule not found: {capsule_path}")
@@ -174,7 +175,7 @@ class EvidenceCapsule:
         for fname in CHECKSUMMED_FILES:
             if fname not in manifest_files:
                 raise ValueError(f"Invalid capsule: manifest has no checksum for '{fname}'")
-        unlisted = sorted(set(contents) - set(manifest_files) - {"manifest.json"})
+        unlisted = sorted(set(contents) - set(manifest_files) - {"manifest.json", SIGNATURE_NAME})
         if unlisted:
             raise ValueError(f"Invalid capsule: files not listed in the manifest: {', '.join(unlisted)}")
         for fname, meta in manifest_files.items():
@@ -194,3 +195,50 @@ class EvidenceCapsule:
             "raw_queries": raw_queries,
             "summary_md": contents["summary.md"].decode("utf-8"),
         }
+
+    @staticmethod
+    def sign(capsule_path: str, key_path: str) -> str:
+        """Add manifest.json.sig, an SSH Ed25519 signature over manifest.json, to an unsigned capsule.
+
+        The capsule must pass unpack first, so only a consistent capsule is signed.
+        The zip is rewritten under a temporary name, so a failed signing leaves the
+        capsule unchanged. ``key_path`` is an OpenSSH key, as for ``ssh-keygen -Y sign``.
+        Returns the fingerprint of the key that signed.
+        """
+        EvidenceCapsule.unpack(capsule_path)
+        with zipfile.ZipFile(capsule_path, "r") as zf:
+            entries = [(info.filename, zf.read(info.filename)) for info in zf.infolist()]
+        if SIGNATURE_NAME in dict(entries):
+            raise ValueError(f"Capsule is already signed: {SIGNATURE_NAME} is present")
+        signature = signing.sign_bytes(dict(entries)["manifest.json"], key_path, CAPSULE_NAMESPACE)
+
+        temp_path = capsule_path + ".signing"
+        try:
+            with zipfile.ZipFile(temp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for name, data in entries:
+                    zf.writestr(name, data)
+                zf.writestr(SIGNATURE_NAME, signature.encode("utf-8"))
+            os.replace(temp_path, capsule_path)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        return signing.signature_fingerprint(signature)
+
+    @staticmethod
+    def verify_signature(capsule_path: str, allowed_signers: str, identity: str) -> signing.SignatureVerdict:
+        """Check manifest.json.sig against an allowed-signers file, after the capsule passes unpack.
+
+        Returns UNSIGNED when the capsule has no signature, and otherwise the
+        verdict from core/signing.py. VALID means the manifest is signed by a key
+        listed for ``identity``, and every file matches the manifest.
+        """
+        EvidenceCapsule.unpack(capsule_path)
+        with zipfile.ZipFile(capsule_path, "r") as zf:
+            names = set(zf.namelist())
+            if SIGNATURE_NAME not in names:
+                return signing.SignatureVerdict(
+                    signing.SIGNATURE_UNSIGNED, None, None, f"no {SIGNATURE_NAME} in the capsule"
+                )
+            manifest_bytes = zf.read("manifest.json")
+            signature = zf.read(SIGNATURE_NAME).decode("utf-8", errors="replace")
+        return signing.verify_signature(manifest_bytes, signature, allowed_signers, identity, CAPSULE_NAMESPACE)

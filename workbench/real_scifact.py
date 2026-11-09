@@ -22,12 +22,15 @@ from the dataset's qrels. The module downloads nothing: it expects a local
 directory in the BEIR layout (``corpus.jsonl``, ``queries.jsonl``,
 ``qrels/<split>.tsv``).
 
-Known differences from the BEIR paper's BM25 baseline (NDCG@10 0.665 on
-SciFact, Pyserini, k1=0.9, b=0.4): the parameters here match, but tokenization
-is a lowercase ``[a-z0-9]+`` split with no stemming, stopping or field
-weighting, so scores will differ. Treat the reference number as a sanity
-neighborhood, not a value this code reproduces; record your own capsule before
-making any comparison public.
+Analyzers (workbench/analysis.py), chosen with ``retrieval_options["analyzer"]``:
+``simple`` (the default, a lowercase ``[a-z0-9]+`` split with no stemming or
+stopping, so its scores are lower and not comparable with a Lucene index) and
+``lucene-english``, which reproduces Lucene's English analysis and BM25 length
+encoding. With ``lucene-english`` the top-10 rankings for all 300 judged SciFact
+test queries match Pyserini's prebuilt ``beir-v1.0.0-scifact.flat`` index
+(k1=0.9, b=0.4); the mean NDCG@10 is 0.6789 and the mean MRR@10 0.6457. The BEIR
+paper's 0.665 is a different baseline: Pyserini's multifield index gives 0.6639,
+and its flat index, the one this matches, 0.6789.
 
 Only the split's judged queries are evaluated: the queries that appear in
 ``qrels/<split>.tsv``. BEIR's ``queries.jsonl`` lists every query of every split
@@ -43,19 +46,19 @@ import json
 import math
 import os
 import platform
-import re
 import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.ledger import EvidenceLedger, compute_sha256
+from .analysis import ANALYZERS, LUCENE_ENGLISH, SIMPLE, analyze, lucene_length_norm, simple_tokens
 from .beir_download import file_digests
 from .engine import (
     ExecutionResult,
-    GovernanceAuthorizationViolation,
     QueryRecord,
     QuotaExceededViolation,
+    enforce_remote_dispatch_grant,
 )
 
 REAL_BACKEND = "bm25-stdlib-scifact"
@@ -81,16 +84,33 @@ RERANK_NOTICE = (
     "ratings, not a trained reranker), scored against the dataset's qrels. Results "
     "can differ across hardware and library versions."
 )
+LUCENE_NOTICE = (
+    "Real retrieval: BM25 (stdlib) with a Lucene-style English analyzer over the local BEIR "
+    "SciFact corpus, scored against the dataset's qrels. A lexical baseline, not a neural model. "
+    "On this corpus its rankings match Pyserini's prebuilt BEIR SciFact flat BM25 index (see the "
+    "README); the BEIR paper's BM25 number is a different baseline."
+)
 NOTICES = {REAL_BACKEND: REAL_NOTICE, DENSE_BACKEND: DENSE_NOTICE, RERANK_BACKEND: RERANK_NOTICE}
 BM25_K1 = 0.9
 BM25_B = 0.4
 
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
-
 
 def tokenize(text: str) -> List[str]:
-    """Lowercase [a-z0-9]+ tokens: no stemming, stopping or field weighting."""
-    return _TOKEN_RE.findall(text.lower())
+    """Lowercase [a-z0-9]+ tokens: no stemming, stopping or field weighting (the default analyzer)."""
+    return simple_tokens(text)
+
+
+def analyzer_of(spec: Any) -> str:
+    """The BM25 analyzer a spec selects through ``retrieval_options["analyzer"]`` (default: simple)."""
+    return (spec.retrieval_options or {}).get("analyzer", SIMPLE)
+
+
+def notice_for(spec: Any) -> str:
+    """The real-retrieval notice a capsule carries for ``spec``; BM25 runs name their analyzer."""
+    label = backend_label(spec)
+    if label == REAL_BACKEND and analyzer_of(spec) == LUCENE_ENGLISH:
+        return LUCENE_NOTICE
+    return NOTICES.get(label, "")
 
 
 @dataclass
@@ -176,13 +196,24 @@ def load_beir_dataset(data_dir: str, split: str = "test") -> SciFactData:
 class BM25Index:
     """Okapi BM25 over a tokenized corpus, with Lucene-style IDF and deterministic ties."""
 
-    def __init__(self, corpus_tokens: Dict[str, List[str]], k1: float = BM25_K1, b: float = BM25_B):
+    def __init__(self, corpus_tokens: Dict[str, List[str]], k1: float = BM25_K1, b: float = BM25_B,
+                 analyzer: str = SIMPLE):
+        """``corpus_tokens`` must come from the same ``analyzer`` that ``search`` applies to queries.
+
+        Under ``lucene-english`` the length normalization uses Lucene's one-byte document
+        lengths (analysis.lucene_length_norm), while the average length stays exact, as in Lucene.
+        """
         self.k1 = k1
         self.b = b
+        self.analyzer = analyzer
         self.n_docs = len(corpus_tokens)
-        self.doc_len = {doc_id: len(tokens) for doc_id, tokens in corpus_tokens.items()}
-        total = sum(self.doc_len.values())
+        exact_len = {doc_id: len(tokens) for doc_id, tokens in corpus_tokens.items()}
+        total = sum(exact_len.values())
         self.avgdl = (total / self.n_docs) if self.n_docs else 0.0
+        if analyzer == LUCENE_ENGLISH:
+            self.doc_len = {doc_id: lucene_length_norm(n) for doc_id, n in exact_len.items()}
+        else:
+            self.doc_len = exact_len
         self.postings: Dict[str, Dict[str, int]] = {}
         for doc_id, tokens in corpus_tokens.items():
             counts: Dict[str, int] = {}
@@ -198,10 +229,10 @@ class BM25Index:
     def search(self, query_text: str, top_k: int = 10) -> List[Tuple[str, float]]:
         """Rank documents by BM25; ties broken by document ID, so the order is deterministic."""
         scores: Dict[str, float] = {}
-        seen: Dict[str, None] = {}  # ordered de-duplication of query terms
-        for term in tokenize(query_text):
-            seen.setdefault(term, None)
-        for term in seen:
+        terms = analyze(query_text, self.analyzer)
+        if self.analyzer != LUCENE_ENGLISH:
+            terms = list(dict.fromkeys(terms))  # the simple analyzer scores each distinct term once
+        for term in terms:  # lucene-english scores every occurrence, as Lucene's BooleanQuery does
             post = self.postings.get(term)
             if not post:
                 continue
@@ -282,6 +313,7 @@ def run_real_scifact(
     data_dir: str,
     ledger: Optional[EvidenceLedger] = None,
     components: Optional[Tuple[Any, Any]] = None,
+    allowed_signers: Optional[str] = None,
 ) -> ExecutionResult:
     """Runs BM25 over the local SciFact corpus behind the same policy gates as the simulated engine.
 
@@ -290,7 +322,8 @@ def run_real_scifact(
     order) are evaluated. The ledger structure mirrors the simulated engine: one
     block per query at timestamps 1000.0 + i, then one consolidation block at
     2000.0. ``components`` overrides the (retriever, reranker) built from the
-    spec for dense runs (tests inject stand-ins).
+    spec for dense runs (tests inject stand-ins). ``allowed_signers`` is the
+    allowed-signers file that remote-dispatch grants are checked against.
     """
     start_time = time.perf_counter()
 
@@ -303,17 +336,14 @@ def run_real_scifact(
 
     # Invariant Gate 2: authorization for remote dispatch (same rule as the simulated engine)
     spec_digest = spec.canonical_digest()
-    if policy.mode == "REMOTE_DISPATCH" or policy.require_authorization_grant:
-        if policy.grant is None:
-            raise GovernanceAuthorizationViolation(
-                f"Remote dispatch rejected: missing authorization grant for payload {spec_digest[:16]}."
-            )
-        if not policy.grant.verify(spec_digest):
-            raise GovernanceAuthorizationViolation(
-                f"Remote dispatch rejected: grant does not match payload {spec_digest[:16]}."
-            )
+    enforce_remote_dispatch_grant(spec, allowed_signers)
 
     label = backend_label(spec)
+    analyzer = analyzer_of(spec)
+    if analyzer not in ANALYZERS:
+        raise ValueError(f"unknown analyzer {analyzer!r}; expected one of {ANALYZERS}")
+    if label != REAL_BACKEND and "analyzer" in (spec.retrieval_options or {}):
+        raise ValueError("the analyzer option applies to the BM25 backend only")
     data = load_beir_dataset(data_dir, split=spec.split)
     if not data.queries:
         raise ValueError(f"No queries found in {os.path.join(data_dir, 'queries.jsonl')}")
@@ -322,8 +352,8 @@ def run_real_scifact(
     ledger = ledger or EvidenceLedger(":memory:")
     try:
         if label == REAL_BACKEND:
-            corpus_tokens = {doc_id: tokenize(text) for doc_id, text in data.corpus.items()}
-            index = BM25Index(corpus_tokens)
+            corpus_tokens = {doc_id: analyze(text, analyzer) for doc_id, text in data.corpus.items()}
+            index = BM25Index(corpus_tokens, analyzer=analyzer)
             retriever = reranker = None
         else:
             retriever, reranker = components if components is not None else build_components(spec)

@@ -8,6 +8,10 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from core import signing
+
+GRANT_NAMESPACE = "dnalang-authorization-grant"
+
 
 def canonical_json_bytes(data: Any) -> bytes:
     """Deterministic JSON bytes: sorted keys, compact separators, UTF-8, NaN rejected.
@@ -34,13 +38,15 @@ def compute_sha256(data: bytes | str) -> str:
 
 @dataclass
 class AuthorizationGrant:
-    """Authorization grant bound to a spec digest (SYS-021 invariant).
+    """Authorization grant bound to a spec digest and a query budget (SYS-021 invariant).
 
-    Reference placeholder, not a cryptographic signature: ``signature`` is an
-    unkeyed SHA-256 of operator, payload digest and budget, so anyone who knows
-    those values can produce a valid grant. ``expires_at_iso`` and
-    ``max_query_budget`` are recorded but not enforced. Replace with a keyed MAC
-    or a public-key signature (for example Ed25519) before relying on it.
+    ``signature`` is an SSH signature (SSHSIG, core/signing.py) made by the key of
+    ``operator`` over the other fields. The engine checks it against an
+    allowed-signers file, so only a key the verifier lists for that operator can
+    authorize a remote dispatch. ``operator`` must be a plain principal name (no
+    spaces, commas, quotes or wildcards). ``max_query_budget`` is enforced.
+    ``expires_at_iso`` is recorded but not enforced, because a capsule must replay
+    the same way later.
     """
     grant_id: str
     operator: str
@@ -49,19 +55,42 @@ class AuthorizationGrant:
     expires_at_iso: str
     signature: str
 
-    def verify(self, payload_sha256: str) -> bool:
-        """Check the grant is bound to this payload digest (see class docstring for limits)."""
+    def signed_bytes(self) -> bytes:
+        """The bytes the signature covers: every field except the signature itself."""
+        return canonical_json_bytes({
+            "expires_at_iso": self.expires_at_iso,
+            "grant_id": self.grant_id,
+            "max_query_budget": self.max_query_budget,
+            "operator": self.operator,
+            "target_payload_sha256": self.target_payload_sha256,
+        })
+
+    def verify(self, payload_sha256: str, allowed_signers: str) -> bool:
+        """True when the grant is bound to this payload and signed by an allowed signer for its operator.
+
+        Raises ValueError or OSError when the allowed-signers file cannot be read or parsed.
+        """
         if self.target_payload_sha256 != payload_sha256:
             return False
-        # Unkeyed hash: proves nothing about who issued the grant
-        expected_sig = compute_sha256(f"{self.operator}:{self.target_payload_sha256}:{self.max_query_budget}")
-        return self.signature == expected_sig
+        return signing.verify_signature(
+            self.signed_bytes(), self.signature, allowed_signers, self.operator, GRANT_NAMESPACE,
+        ).ok
+
+    @classmethod
+    def issue(cls, key_path: str, *, grant_id: str, operator: str, target_payload_sha256: str,
+              max_query_budget: int, expires_at_iso: str) -> "AuthorizationGrant":
+        """Create a grant signed with the OpenSSH key at ``key_path`` (see core/signing.py)."""
+        signing.check_principal(operator)
+        grant = cls(grant_id=grant_id, operator=operator, target_payload_sha256=target_payload_sha256,
+                    max_query_budget=max_query_budget, expires_at_iso=expires_at_iso, signature="")
+        grant.signature = signing.sign_bytes(grant.signed_bytes(), key_path, GRANT_NAMESPACE)
+        return grant
 
 
 @dataclass
 class ExecutionPolicy:
     """Execution policy. The engine checks max_query_ceiling and, for REMOTE_DISPATCH,
-    the grant; timeout_seconds is recorded but not enforced."""
+    the grant (signature, payload and budget); timeout_seconds is recorded but not enforced."""
     mode: str = "LOCAL_BOUNDED"  # "LOCAL_BOUNDED" or "REMOTE_DISPATCH"
     max_query_ceiling: int = 100
     timeout_seconds: float = 300.0

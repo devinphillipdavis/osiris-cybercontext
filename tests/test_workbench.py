@@ -2,12 +2,21 @@
 
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 import warnings
 import zipfile
 
-from workbench.schema import ExperimentSpec, ExecutionPolicy, AuthorizationGrant, canonical_json_bytes, compute_sha256
+from workbench.schema import (
+    GRANT_NAMESPACE,
+    ExperimentSpec,
+    ExecutionPolicy,
+    AuthorizationGrant,
+    canonical_json_bytes,
+    compute_sha256,
+)
 from workbench.engine import (
     EvidenceWorkbenchEngine,
     GovernanceAuthorizationViolation,
@@ -17,6 +26,9 @@ from workbench.capsule import EvidenceCapsule
 from workbench.replay import ReplayEngine, ReplayStatus
 
 
+HAVE_SSH_KEYGEN = shutil.which("ssh-keygen") is not None
+
+
 def _execute(spec):
     """Run a spec in a fresh engine and close its in-memory ledger."""
     engine = EvidenceWorkbenchEngine()
@@ -24,6 +36,23 @@ def _execute(spec):
         return engine.execute(spec)
     finally:
         engine.ledger.close()
+
+
+def _ssh_key(directory, name):
+    """A throwaway OpenSSH Ed25519 key; returns the private key path."""
+    path = os.path.join(directory, name)
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", name, "-f", path], check=True)
+    return path
+
+
+def _allowed_signers(directory, key_path, identity, namespace):
+    """An allowed-signers file that trusts ``key_path`` for ``identity`` in ``namespace``."""
+    with open(key_path + ".pub", encoding="utf-8") as f:
+        pub = f.read().strip()
+    path = os.path.join(directory, "allowed_signers")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f'{identity} namespaces="{namespace}" {pub}\n')
+    return path
 
 
 class TestEvidenceWorkbench(unittest.TestCase):
@@ -90,8 +119,9 @@ class TestEvidenceWorkbench(unittest.TestCase):
         self.assertEqual(verdict.metric_diffs["NDCG@10"], 0.0)
         self.assertEqual(verdict.metric_diffs["MRR@10"], 0.0)
 
+    @unittest.skipUnless(HAVE_SSH_KEYGEN, "ssh-keygen (OpenSSH) is not installed")
     def test_governance_authorization_gate_sys021(self):
-        """Verify remote dispatch without valid grant is denied fail-closed (SYS-021)."""
+        """Verify remote dispatch without a grant signed by an allowed signer is denied fail-closed (SYS-021)."""
         spec = ExperimentSpec(
             experiment_id="EXP-REMOTE-UNAUTHORIZED",
             model_id="allenai/Olmo-3-7B-Instruct",
@@ -101,24 +131,23 @@ class TestEvidenceWorkbench(unittest.TestCase):
             query_count=5,
             execution_policy=ExecutionPolicy(mode="REMOTE_DISPATCH", require_authorization_grant=True),
         )
-        engine = EvidenceWorkbenchEngine()
+        key = _ssh_key(self.tmp_dir.name, "operator")
+        allowed = _allowed_signers(self.tmp_dir.name, key, "devin", GRANT_NAMESPACE)
+        engine = EvidenceWorkbenchEngine(allowed_signers=allowed)
         self.addCleanup(engine.ledger.close)
 
         with self.assertRaises(GovernanceAuthorizationViolation):
             engine.execute(spec)
 
-        # Now test with valid grant
-        spec_digest = spec.canonical_digest()
-        valid_sig = compute_sha256(f"Devin Phillip Davis:{spec_digest}:100")
-        grant = AuthorizationGrant(
+        # Now test with a grant signed by the operator's key
+        spec.execution_policy.grant = AuthorizationGrant.issue(
+            key,
             grant_id="GRANT-2026-001",
-            operator="Devin Phillip Davis",
-            target_payload_sha256=spec_digest,
+            operator="devin",
+            target_payload_sha256=spec.canonical_digest(),
             max_query_budget=100,
             expires_at_iso="2026-12-31T00:00:00Z",
-            signature=valid_sig,
         )
-        spec.execution_policy.grant = grant
         # Should now succeed without raising
         result = engine.execute(spec)
         self.assertEqual(result.metrics["queries_evaluated"], 5)
@@ -443,15 +472,25 @@ class TestEvidenceWorkbench(unittest.TestCase):
         self.assertEqual(verdict.status, ReplayStatus.NOT_REPLAYABLE)
         self.assertFalse(verdict.is_passing())
 
+    @unittest.skipUnless(HAVE_SSH_KEYGEN, "ssh-keygen (OpenSSH) is not installed")
     def test_authorized_remote_dispatch_capsule_replays(self):
+        key = _ssh_key(self.tmp_dir.name, "operator")
+        allowed = _allowed_signers(self.tmp_dir.name, key, "devin", GRANT_NAMESPACE)
         spec = self._spec(execution_policy=ExecutionPolicy(mode="REMOTE_DISPATCH", require_authorization_grant=True))
-        digest = spec.canonical_digest()
-        spec.execution_policy.grant = AuthorizationGrant(
-            grant_id="GRANT-TEST", operator="op", target_payload_sha256=digest, max_query_budget=100,
-            expires_at_iso="2099-01-01T00:00:00Z", signature=compute_sha256(f"op:{digest}:100"),
+        spec.execution_policy.grant = AuthorizationGrant.issue(
+            key, grant_id="GRANT-TEST", operator="devin", target_payload_sha256=spec.canonical_digest(),
+            max_query_budget=100, expires_at_iso="2099-01-01T00:00:00Z",
         )
-        EvidenceCapsule.pack(_execute(spec), self.capsule_path)
-        self.assertEqual(ReplayEngine.replay(self.capsule_path).status, ReplayStatus.EXACT_MATCH)
+        engine = EvidenceWorkbenchEngine(allowed_signers=allowed)
+        try:
+            result = engine.execute(spec)
+        finally:
+            engine.ledger.close()
+        EvidenceCapsule.pack(result, self.capsule_path)
+        self.assertEqual(ReplayEngine.replay(self.capsule_path, allowed_signers=allowed).status,
+                         ReplayStatus.EXACT_MATCH)
+        # Without the allowed signers the stored grant cannot be checked, so the re-run is refused
+        self.assertEqual(ReplayEngine.replay(self.capsule_path).status, ReplayStatus.NOT_REPLAYABLE)
 
     def test_unpack_rejects_incomplete_or_padded_capsules(self):
         def drop_digest(files, manifest):

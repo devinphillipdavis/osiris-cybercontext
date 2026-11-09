@@ -337,7 +337,10 @@ class TestRealCorpus(unittest.TestCase):
     def test_real_corpus_run_replays_exactly(self):
         data_dir = os.environ["OSIRIS_SCIFACT_DIR"]
         queries = int(os.environ.get("OSIRIS_SCIFACT_QUERIES", "25"))
-        spec = _toy_spec(experiment_id="EXP-SCIFACT-REAL-001", query_count=queries)
+        spec = _toy_spec(
+            experiment_id="EXP-SCIFACT-REAL-001", query_count=queries,
+            execution_policy=ExecutionPolicy(mode="LOCAL_BOUNDED", max_query_ceiling=queries),
+        )
         result = run_real_scifact(spec, data_dir)
 
         self.assertEqual(result.retrieval_backend, REAL_BACKEND)
